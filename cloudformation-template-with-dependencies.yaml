@@ -1,0 +1,532 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Primary region - 3-tier VPC, ALB, ASG (web/app), RDS MariaDB (single-AZ), Regional NAT, CloudWatch→SNS, CloudFront origin input
+
+Parameters:
+  VpcCidr: { Type: String, Default: 10.0.0.0/20 }
+  PublicSubnetACidr: { Type: String, Default: 10.0.0.0/24 }
+  PublicSubnetBCidr: { Type: String, Default: 10.0.1.0/24 }
+  AppSubnetACidr: { Type: String, Default: 10.0.10.0/24 }
+  AppSubnetBCidr: { Type: String, Default: 10.0.12.0/24 }
+  DbSubnetACidr: { Type: String, Default: 10.0.11.0/24 }
+  DbSubnetBCidr: { Type: String, Default: 10.0.13.0/24 }
+  InstanceTypeWeb: { Type: String, Default: t3.micro }
+  InstanceTypeApp: { Type: String, Default: t3.micro }
+  # In sandbox, SSM public parameters may be blocked; use direct AMI ID default for us-east-1
+  AmiId:
+    {
+      Type: String,
+      Default: ami-0c02fb55956c7d316,
+      Description: Amazon Linux 2 AMI ID (us-east-1),
+    }
+  DBUsername: { Type: String, NoEcho: true, MinLength: 1 }
+  DBPassword: { Type: String, NoEcho: true, MinLength: 8 }
+  DBName: { Type: String, Default: globalbookdb }
+  EmailEndpoint: { Type: String, Default: "dobiya4358@crsay.com" }
+  DesiredCapacityWeb: { Type: Number, Default: 2 }
+  DesiredCapacityApp: { Type: Number, Default: 2 }
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AZs: ["us-east-1a", "us-east-1b"]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: primary-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RegionalNAT:
+    Type: AWS::EC2::NatGateway
+    DependsOn: [VPC, AttachIGW]
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityMode: regional
+      Tags: [{ Key: Name, Value: primary-regional-nat }]
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone:
+        !Select [0, !FindInMap [RegionMap, !Ref "AWS::Region", AZs]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: Web-Public-A }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone:
+        !Select [1, !FindInMap [RegionMap, !Ref "AWS::Region", AZs]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: Web-Public-B }]
+
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref AppSubnetACidr
+      AvailabilityZone:
+        !Select [0, !FindInMap [RegionMap, !Ref "AWS::Region", AZs]]
+      Tags: [{ Key: Name, Value: App-Private-A1 }]
+
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref AppSubnetBCidr
+      AvailabilityZone:
+        !Select [1, !FindInMap [RegionMap, !Ref "AWS::Region", AZs]]
+      Tags: [{ Key: Name, Value: App-Private-B1 }]
+
+  DbSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref DbSubnetACidr
+      AvailabilityZone:
+        !Select [0, !FindInMap [RegionMap, !Ref "AWS::Region", AZs]]
+      Tags: [{ Key: Name, Value: DB-Private-A2 }]
+
+  DbSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref DbSubnetBCidr
+      AvailabilityZone:
+        !Select [1, !FindInMap [RegionMap, !Ref "AWS::Region", AZs]]
+      Tags: [{ Key: Name, Value: DB-Private-B2 }]
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: Public-RT }]
+
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: Private-RT }]
+
+  PublicIPv4:
+    Type: AWS::EC2::Route
+    DependsOn: [PublicRT, AttachIGW]
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateIPv4:
+    Type: AWS::EC2::Route
+    DependsOn: [PrivateRT, RegionalNAT]
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref RegionalNAT
+
+  AssocPubA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [PublicSubnetA, PublicRT, PublicIPv4]
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRT
+
+  AssocPubB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [PublicSubnetB, PublicRT, PublicIPv4]
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRT
+
+  AssocAppA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [AppSubnetA, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      RouteTableId: !Ref PrivateRT
+
+  AssocAppB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [AppSubnetB, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      RouteTableId: !Ref PrivateRT
+
+  AssocDbA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [DbSubnetA, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref DbSubnetA
+      RouteTableId: !Ref PrivateRT
+
+  AssocDbB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [DbSubnetB, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref DbSubnetB
+      RouteTableId: !Ref PrivateRT
+
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web/ALB ingress 80/443
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Allow internet traffic to ALB and instances
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: Web-SG }]
+
+  AppALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal App ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {
+            IpProtocol: tcp,
+            FromPort: 80,
+            ToPort: 80,
+            SourceSecurityGroupId: !Ref WebSG,
+          }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: App-ALB-SG }]
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App ingress from App ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {
+            IpProtocol: tcp,
+            FromPort: 80,
+            ToPort: 80,
+            SourceSecurityGroupId: !Ref AppALBSG,
+          }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: App-SG }]
+
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB ingress from app tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {
+            IpProtocol: tcp,
+            FromPort: 3306,
+            ToPort: 3306,
+            SourceSecurityGroupId: !Ref AppSG,
+          }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: DB-SG }]
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: primary-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref WebSG]
+      Tags: [{ Key: Name, Value: primary-alb }]
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: primary-alb-tg
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: 200 }
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  AppALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: app-internal-alb
+      Scheme: internal
+      Type: application
+      Subnets: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroups: [!Ref AppALBSG]
+      Tags: [{ Key: Name, Value: app-internal-alb }]
+
+  AppALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: app-alb-tg
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: 200 }
+
+  AppALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppALBTargetGroup
+
+  LaunchTemplateWeb:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceTypeWeb
+        SecurityGroupIds: [!Ref WebSG]
+        UserData: !Base64 |
+          #!/bin/bash
+          set -e
+          # Update system
+          yum update -y
+          # Install Apache
+          yum install -y httpd
+          # Create index page
+          echo "<html><body><h1>Welcome to my ASG instance (Web)</h1><p>Instance is healthy!</p></body></html>" > /var/www/html/index.html
+          # Create health check endpoint
+          echo "OK" > /var/www/html/health
+          chmod 644 /var/www/html/index.html
+          chmod 644 /var/www/html/health
+          # Enable and start Apache
+          systemctl enable httpd
+          systemctl start httpd
+          # Wait for Apache to fully start
+          sleep 15
+          # Verify Apache is running
+          systemctl status httpd || systemctl restart httpd
+          # Test local connectivity
+          curl -f http://localhost/ || echo "Local curl test failed"
+          curl -f http://localhost/health || echo "Health check endpoint test failed"
+
+  ASGWeb:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: !Ref DesiredCapacityWeb
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateWeb
+        Version: !GetAtt LaunchTemplateWeb.LatestVersionNumber
+      TargetGroupARNs: [!Ref ALBTargetGroup]
+      Tags:
+        - Key: Name
+          Value: web-asg
+          PropagateAtLaunch: true
+
+  LaunchTemplateApp:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceTypeApp
+        SecurityGroupIds: [!Ref AppSG]
+        UserData: !Base64 |
+          #!/bin/bash
+          set -e
+          # تحديث الحزم
+          yum update -y
+          # تثبيت Apache
+          yum install -y httpd
+          # Create index page
+          echo "<html><body><h1>Welcome to my ASG instance (App)</h1><p>Instance is healthy!</p></body></html>" > /var/www/html/index.html
+          # Create health check endpoint
+          echo "OK" > /var/www/html/health
+          chmod 644 /var/www/html/index.html
+          chmod 644 /var/www/html/health
+          # تشغيل Apache عند كل Boot
+          systemctl enable httpd
+          # تشغيل Apache دلوقتي
+          systemctl start httpd
+          # Ensure Apache is fully started
+          sleep 15
+          systemctl restart httpd
+          # Verify Apache is running
+          if systemctl is-active --quiet httpd; then
+            echo "Apache is running."
+          else
+            echo "Apache failed to start."
+            exit 1
+          fi
+          # Test local connectivity
+          if curl -s http://localhost/health | grep -q "OK"; then
+            echo "Health check endpoint is responsive."
+          else
+            echo "Health check endpoint is not responsive."
+            exit 1
+          fi
+
+  ASGApp:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: !Ref DesiredCapacityApp
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateApp
+        Version: !GetAtt LaunchTemplateApp.LatestVersionNumber
+      TargetGroupARNs: [!Ref AppALBTargetGroup]
+      Tags:
+        - Key: Name
+          Value: app-asg
+          PropagateAtLaunch: true
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    DependsOn: [DbSubnetA, DbSubnetB]
+    Properties:
+      DBSubnetGroupDescription: Primary DB subnets
+      SubnetIds: [!Ref DbSubnetA, !Ref DbSubnetB]
+      DBSubnetGroupName: primary-db-subnetgrp
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: [DbSubnetGroup, DbSG]
+    Properties:
+      DBInstanceIdentifier: primary-mariadb
+      Engine: mariadb
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      VPCSecurityGroups: [!Ref DbSG]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      MultiAZ: false # sandbox disallows Multi-AZ
+      PubliclyAccessible: false
+      StorageType: gp2
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: primary-alarms
+      Subscription:
+        - Endpoint: !Ref EmailEndpoint
+          Protocol: email
+
+  CPUAlarmWeb:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: web-asg-high-cpu
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASGWeb
+      AlarmActions: [!Ref SNSTopic]
+
+  CPUAlarmApp:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: app-asg-high-cpu
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASGApp
+      AlarmActions: [!Ref SNSTopic]
+
+  # Dynamic Scaling Policies for Web ASG
+  WebScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASGWeb
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+      PolicyName: WebASG-CPU-TargetTracking
+
+  # Dynamic Scaling Policies for App ASG
+  AppScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASGApp
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+      PolicyName: AppASG-CPU-TargetTracking
+
+Outputs:
+  VpcId: { Value: !Ref VPC }
+  PublicSubnets:
+    { Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]] }
+  AppSubnets: { Value: !Join [",", [!Ref AppSubnetA, !Ref AppSubnetB]] }
+  DbSubnets: { Value: !Join [",", [!Ref DbSubnetA, !Ref DbSubnetB]] }
+  ALBDNS: { Value: !GetAtt ALB.DNSName }
+  ALBHostedZoneId: { Value: !GetAtt ALB.CanonicalHostedZoneID }
+  AppALBDNS: { Value: !GetAtt AppALB.DNSName }
+  AppALBHostedZoneId: { Value: !GetAtt AppALB.CanonicalHostedZoneID }

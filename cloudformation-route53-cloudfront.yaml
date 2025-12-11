@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Route 53 failover + CloudFront origin group (Primary ALB → Spare NLB)
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: globalbook.com
+    Description: Domain name for the hosted zone (e.g., globalbook.com)
+  PrimaryALBDNSName:
+    Type: String
+    Description: DNS name of the primary region ALB (e.g., primary-alb-1234567890.us-east-1.elb.amazonaws.com)
+    MinLength: 1
+  PrimaryALBHostedZoneId:
+    Type: String
+    Description: Hosted Zone ID of the primary region ALB (found in ALB details, e.g., Z35SXDOTRQ7X7K)
+    MinLength: 1
+  SpareNLBDNSName:
+    Type: String
+    Description: DNS name of the spare region NLB (e.g., spare-nlb-1234567890.elb.us-west-2.amazonaws.com)
+    MinLength: 1
+  SpareNLBHostedZoneId:
+    Type: String
+    Description: Hosted Zone ID of the spare region NLB (found in NLB details in EC2 console)
+    MinLength: 1
+  HealthCheckPath:
+    Type: String
+    Default: /health
+    Description: Health check path (e.g., /health or /)
+  HealthCheckProtocol:
+    Type: String
+    AllowedValues: [HTTP, HTTPS]
+    Default: HTTPS
+    Description: Health check protocol (HTTP or HTTPS)
+  HealthCheckPort:
+    Type: Number
+    Default: 443
+    Description: Health check port (80 for HTTP, 443 for HTTPS)
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: CloudFront price class for edge locations
+
+Conditions:
+  UseHTTPS: !Equals [!Ref HealthCheckProtocol, HTTPS]
+
+Resources:
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Sub "${DomainName}."
+
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: !If [UseHTTPS, HTTPS, HTTP]
+        ResourcePath: !Ref HealthCheckPath
+        FullyQualifiedDomainName: !Ref PrimaryALBDNSName
+        Port: !Ref HealthCheckPort
+        RequestInterval: 30
+        FailureThreshold: 3
+        MeasureLatency: true
+        Regions: [us-east-1, us-west-2, eu-west-1]
+
+  PrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: [HostedZone, PrimaryHealthCheck]
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub "www.${DomainName}."
+      Type: A
+      SetIdentifier: primary-alb
+      AliasTarget:
+        DNSName: !Ref PrimaryALBDNSName
+        HostedZoneId: !Ref PrimaryALBHostedZoneId
+        EvaluateTargetHealth: true
+      Failover: PRIMARY
+      HealthCheckId: !Ref PrimaryHealthCheck
+
+  SecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: [HostedZone, PrimaryRecord]
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub "www.${DomainName}."
+      Type: A
+      SetIdentifier: spare-nlb
+      AliasTarget:
+        DNSName: !Ref SpareNLBDNSName
+        HostedZoneId: !Ref SpareNLBHostedZoneId
+        EvaluateTargetHealth: true
+      Failover: SECONDARY
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: origin-access
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: [PrimaryRecord, SecondaryRecord]
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        Origins:
+          - Id: primary-alb-origin
+            DomainName: !Ref PrimaryALBDNSName
+            CustomOriginConfig:
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginProtocolPolicy: https-only
+          - Id: spare-nlb-origin
+            DomainName: !Ref SpareNLBDNSName
+            CustomOriginConfig:
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+        OriginGroups:
+          Quantity: 1
+          Items:
+            - Id: failover-group
+              FailoverCriteria:
+                StatusCodes:
+                  Quantity: 4
+                  Items: [500, 502, 503, 504]
+              Members:
+                Quantity: 2
+                Items:
+                  - OriginId: primary-alb-origin
+                  - OriginId: spare-nlb-origin
+        DefaultCacheBehavior:
+          TargetOriginId: failover-group
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          ForwardedValues:
+            QueryString: true
+            Cookies: { Forward: none }
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  HostedZoneId: { Value: !Ref HostedZone }
+  CloudFrontDomain: { Value: !GetAtt Distribution.DomainName }

@@ -1,0 +1,404 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Spare region - 3-tier (1 AZ), NLB, ASG web/app, RDS MariaDB single-AZ, Regional NAT, CloudWatch→SNS
+
+Parameters:
+  VpcCidr: { Type: String, Default: 10.1.0.0/20 }
+  WebSubnetCidr: { Type: String, Default: 10.1.0.0/24 }
+  AppSubnetCidr: { Type: String, Default: 10.1.10.0/24 }
+  DbSubnetCidr: { Type: String, Default: 10.1.11.0/24 }
+  DbSubnetCidr2:
+    {
+      Type: String,
+      Default: 10.1.12.0/24,
+      Description: Second DB subnet for RDS multi-AZ requirement,
+    }
+  InstanceTypeWeb: { Type: String, Default: t3.micro }
+  InstanceTypeApp: { Type: String, Default: t3.micro }
+  AmiId:
+    {
+      Type: String,
+      Default: ami-0ebf411a80b6b22cb,
+      Description: Amazon Linux 2 AMI ID (us-east-1 example),
+    }
+  DBUsername: { Type: String, NoEcho: true }
+  DBPassword: { Type: String, NoEcho: true, MinLength: 8 }
+  DBName: { Type: String, Default: globalbookdb }
+  EmailEndpoint: { Type: String, Default: "dobiya4358@crsay.com" }
+  DesiredCapacityWeb: { Type: Number, Default: 1 }
+  DesiredCapacityApp: { Type: Number, Default: 1 }
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: spare-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RegionalNAT:
+    Type: AWS::EC2::NatGateway
+    DependsOn: [VPC, AttachIGW]
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityMode: regional
+      Tags: [{ Key: Name, Value: spare-regional-nat }]
+
+  WebSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref WebSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: Spare-Web-Public }]
+
+  AppSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref AppSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: Spare-App-Private }]
+
+  DbSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref DbSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: Spare-DB-Private-A }]
+
+  DbSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref DbSubnetCidr2
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: Spare-DB-Private-B }]
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: Spare-Public-RT }]
+
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: Spare-Private-RT }]
+
+  PublicIPv4:
+    Type: AWS::EC2::Route
+    DependsOn: [PublicRT, AttachIGW]
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateIPv4:
+    Type: AWS::EC2::Route
+    DependsOn: [PrivateRT, RegionalNAT]
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref RegionalNAT
+
+  AssocWeb:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [WebSubnet, PublicRT, PublicIPv4]
+    Properties:
+      SubnetId: !Ref WebSubnet
+      RouteTableId: !Ref PublicRT
+
+  AssocApp:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [AppSubnet, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref AppSubnet
+      RouteTableId: !Ref PrivateRT
+
+  AssocDb:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [DbSubnet, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref DbSubnet
+      RouteTableId: !Ref PrivateRT
+
+  AssocDb2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [DbSubnet2, PrivateRT, PrivateIPv4]
+    Properties:
+      SubnetId: !Ref DbSubnet2
+      RouteTableId: !Ref PrivateRT
+
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      GroupDescription: Web/NLB ingress 80/443
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: Spare-Web-SG }]
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      GroupDescription: App ingress from web tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {
+            IpProtocol: tcp,
+            FromPort: 80,
+            ToPort: 80,
+            CidrIp: !Ref WebSubnetCidr,
+          }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: Spare-App-SG }]
+
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      GroupDescription: DB ingress from app tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {
+            IpProtocol: tcp,
+            FromPort: 3306,
+            ToPort: 3306,
+            SourceSecurityGroupId: !Ref AppSG,
+          }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: Spare-DB-SG }]
+
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: [WebSubnet]
+    Properties:
+      Name: spare-nlb
+      Scheme: internet-facing
+      Type: network
+      Subnets: [!Ref WebSubnet]
+      Tags: [{ Key: Name, Value: spare-nlb }]
+
+  NLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: [VPC]
+    Properties:
+      Name: spare-nlb-tg
+      Protocol: TCP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckPort: 80
+
+  NLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: [NLB, NLBTargetGroup]
+    Properties:
+      LoadBalancerArn: !Ref NLB
+      Port: 80
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NLBTargetGroup
+
+  LaunchTemplateWeb:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: [WebSG]
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceTypeWeb
+        SecurityGroupIds: [!Ref WebSG]
+        UserData: !Base64 |
+          #!/bin/bash
+          set -e
+          # Update system
+          yum update -y
+          # Install Apache
+          yum install -y httpd
+          # Create index page
+          echo "<html><body><h1>Welcome to my ASG instance (Spare Web)</h1><p>Instance is healthy!</p></body></html>" > /var/www/html/index.html
+          # Create health check endpoint
+          echo "OK" > /var/www/html/health
+          chmod 644 /var/www/html/index.html
+          chmod 644 /var/www/html/health
+          # Enable and start Apache
+          systemctl enable httpd
+          systemctl start httpd
+          # Wait for Apache to fully start
+          sleep 15
+          # Verify Apache is running
+          systemctl status httpd || systemctl restart httpd
+          # Test local connectivity
+          curl -f http://localhost/ || echo "Local curl test failed"
+          curl -f http://localhost/health || echo "Health check endpoint test failed"
+
+  ASGWeb:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [LaunchTemplateWeb, WebSubnet, NLBTargetGroup]
+    Properties:
+      VPCZoneIdentifier: [!Ref WebSubnet]
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: !Ref DesiredCapacityWeb
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateWeb
+        Version: !GetAtt LaunchTemplateWeb.LatestVersionNumber
+      TargetGroupARNs: [!Ref NLBTargetGroup]
+      Tags:
+        - Key: Name
+          Value: spare-web-asg
+          PropagateAtLaunch: true
+
+  LaunchTemplateApp:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: [AppSG]
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceTypeApp
+        SecurityGroupIds: [!Ref AppSG]
+        UserData: !Base64 |
+          #!/bin/bash
+          set -e
+          # تحديث الحزم
+          yum update -y
+          # تثبيت Apache
+          yum install -y httpd
+          # Create index page
+          echo "<html><body><h1>Welcome to my ASG instance (Spare App)</h1><p>Instance is healthy!</p></body></html>" > /var/www/html/index.html
+          # Create health check endpoint
+          echo "OK" > /var/www/html/health
+          chmod 644 /var/www/html/index.html
+          chmod 644 /var/www/html/health
+          # تشغيل Apache عند كل Boot
+          systemctl enable httpd
+          # تشغيل Apache دلوقتي
+          systemctl start httpd
+          # Wait for Apache to fully start
+          sleep 15
+          # Verify Apache is running
+          systemctl status httpd || systemctl restart httpd
+          # Test local connectivity
+          curl -f http://localhost/ || echo "Local curl test failed"
+          curl -f http://localhost/health || echo "Health check endpoint test failed"
+
+  ASGApp:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [LaunchTemplateApp, AppSubnet]
+    Properties:
+      VPCZoneIdentifier: [!Ref AppSubnet]
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: !Ref DesiredCapacityApp
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateApp
+        Version: !GetAtt LaunchTemplateApp.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: spare-app-asg
+          PropagateAtLaunch: true
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    DependsOn: [DbSubnet, DbSubnet2]
+    Properties:
+      DBSubnetGroupDescription: Spare DB subnet group (2 AZs for RDS requirement)
+      SubnetIds: [!Ref DbSubnet, !Ref DbSubnet2]
+      DBSubnetGroupName: spare-db-subnetgrp
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: [DbSubnetGroup, DbSG]
+    Properties:
+      DBInstanceIdentifier: spare-mariadb
+      Engine: mariadb
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      VPCSecurityGroups: [!Ref DbSG]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageType: gp2
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: spare-alarms
+      Subscription:
+        - Endpoint: !Ref EmailEndpoint
+          Protocol: email
+
+  CPUAlarmWeb:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [ASGWeb, SNSTopic]
+    Properties:
+      AlarmName: spare-web-asg-high-cpu
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASGWeb
+      AlarmActions: [!Ref SNSTopic]
+
+  CPUAlarmApp:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [ASGApp, SNSTopic]
+    Properties:
+      AlarmName: spare-app-asg-high-cpu
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASGApp
+      AlarmActions: [!Ref SNSTopic]
+
+Outputs:
+  VpcId: { Value: !Ref VPC }
+  PublicSubnet: { Value: !Ref WebSubnet }
+  AppSubnet: { Value: !Ref AppSubnet }
+  DbSubnet: { Value: !Ref DbSubnet }
+  DbSubnet2: { Value: !Ref DbSubnet2 }
+  NLBDNS: { Value: !GetAtt NLB.DNSName }
+  NLBHostedZoneId: { Value: !GetAtt NLB.CanonicalHostedZoneID }
