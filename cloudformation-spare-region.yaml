@@ -18,7 +18,7 @@ Parameters:
     {
       Type: String,
       Default: ami-0ebf411a80b6b22cb,
-      Description: Amazon Linux 2 AMI ID (us-east-1 example),
+      Description: Amazon Linux 2 AMI ID for us-west-2 (Oregon). Get latest: aws ec2 describe-images --region us-west-2 --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId',
     }
   DBUsername: { Type: String, NoEcho: true }
   DBPassword: { Type: String, NoEcho: true, MinLength: 8 }

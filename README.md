@@ -312,8 +312,8 @@ GlobalBook is a production-ready, multi-region e-commerce platform built on AWS 
 - `AmiId`: Amazon Linux 2 AMI ID for us-east-1 (default provided)
 
 **Key Outputs to Save:**
-- `ALBDNSName`: Primary ALB DNS name
-- `ALBHostedZoneId`: Primary ALB Hosted Zone ID
+- `ALBDNS`: Primary ALB DNS name (use this value for `PrimaryALBDNSName` in Route 53 stack)
+- `ALBHostedZoneId`: Primary ALB Hosted Zone ID (use this value for `PrimaryALBHostedZoneId` in Route 53 stack)
 
 **Example:**
 ```bash
@@ -353,8 +353,8 @@ aws ec2 describe-images \
 ```
 
 **Key Outputs to Save:**
-- `NLBDNS`: Spare NLB DNS name
-- `NLBHostedZoneId`: Spare NLB Hosted Zone ID
+- `NLBDNS`: Spare NLB DNS name (use this value for `SpareNLBDNSName` in Route 53 stack)
+- `NLBHostedZoneId`: Spare NLB Hosted Zone ID (use this value for `SpareNLBHostedZoneId` in Route 53 stack)
 
 **Example:**
 ```bash
